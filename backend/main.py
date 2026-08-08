@@ -200,3 +200,74 @@ logger.info(
     f"{result.unique_pairs} pairs, {result.directed_edges_created} directed edges"
 )
 return result
+
+# ============================================================================
+# User CRUD Endpoints
+# ============================================================================
+
+@app.get("/api/v1/users")
+async def list_users(
+    limit: int = 1000,
+    client=Depends(get_client)
+):
+    """List all users with optional limit."""
+    repo = UserRepository(client)
+    return {"items": repo.get_all(limit), "total": repo.count()}
+
+
+@app.post("/api/v1/users")
+async def create_user(
+    user: UserCreate,
+    client=Depends(get_client)
+):
+    """Create a new user."""
+    repo = UserRepository(client)
+
+    # Check if user already exists
+    existing = repo.get_by_id(user._id)
+    if existing:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail={"message": f"User '{user._id}' already exists"}
+        )
+
+    username = user.username or user._id
+    return repo.create(user._id, username)
+
+
+@app.put("/api/v1/users/{user_id}")
+async def update_user(
+    user_id: str,
+    update: UserUpdate,
+    client=Depends(get_client)
+):
+    """Update a user's username."""
+    repo = UserRepository(client)
+
+    existing = repo.get_by_id(user_id)
+    if not existing:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail={"message": f"User '{user_id}' not found"}
+        )
+
+    return repo.update(user_id, update.username)
+
+
+@app.delete("/api/v1/users/{user_id}")
+async def delete_user(
+    user_id: str,
+    client=Depends(get_client)
+):
+    """Delete a user and all associated relationships."""
+    repo = UserRepository(client)
+
+    existing = repo.get_by_id(user_id)
+    if not existing:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail={"message": f"User '{user_id}' not found"}
+        )
+
+    repo.delete(user_id)
+    return {"deleted": True, "user_id": user_id}
