@@ -1,0 +1,134 @@
+<!doctype html>
+<html lang="fa" dir="rtl">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>تحلیل شبکه اجتماعی</title>
+  <link rel="stylesheet" href="/static/styles.css">
+</head>
+<body>
+  <div id="toast" class="toast" role="status"></div>
+  <aside class="sidebar">
+    <div class="brand">
+      <span class="brand-icon">◉</span>
+      <div><strong>تحلیل شبکه اجتماعی</strong><small>NexoraDB LiveGraph</small></div>
+    </div>
+    <nav id="nav">
+      <button data-page="dashboard" class="active">داشبورد</button>
+      <button data-page="import">ورود فایل</button>
+      <button data-page="users">کاربران</button>
+      <button data-page="relationships">ارتباط‌ها</button>
+      <button data-page="graph">گراف زنده</button>
+      <button data-page="algorithms">الگوریتم‌ها</button>
+    </nav>
+    <div id="connection" class="connection">در حال بررسی اتصال…</div>
+  </aside>
+
+  <main>
+    <header class="topbar">
+      <div><h1 id="page-title">داشبورد</h1><p>برنامه خارجی متصل به NexoraDB با Python Driver</p></div>
+      <button id="refresh" class="button ghost">تازه‌سازی</button>
+    </header>
+
+    <section id="page-dashboard" class="page active">
+      <div class="metrics">
+        <article><span>وضعیت دیتابیس</span><strong id="m-status">—</strong></article>
+        <article><span>کاربران</span><strong id="m-users">۰</strong></article>
+        <article><span>ارتباط دوطرفه</span><strong id="m-pairs">۰</strong></article>
+        <article><span>یال جهت‌دار</span><strong id="m-edges">۰</strong></article>
+      </div>
+      <div class="card hero">
+        <div><h2>گراف شما Live است</h2><p>هر تغییر CRUD همان لحظه در گراف اعمال می‌شود و Build مجدد لازم نیست.</p></div>
+        <button class="button primary goto" data-target="import">ورود اولین فایل</button>
+      </div>
+    </section>
+
+    <section id="page-import" class="page">
+      <div class="card narrow">
+        <h2>ورود فایل ارتباط‌ها</h2>
+        <p class="muted">هر خط: کاربر اول، کاربر دوم و عدد ۱ برای ارتباط دوطرفه</p>
+        <pre>U01 U02 1
+U01 U03 1
+U02 U03 1</pre>
+        <label class="dropzone" for="file-input">
+          <strong>فایل TXT را انتخاب کنید</strong>
+          <span id="file-name">حداکثر ۱۰ مگابایت، UTF-8</span>
+          <input id="file-input" type="file" accept=".txt,text/plain">
+        </label>
+        <textarea id="file-preview" readonly placeholder="پیش‌نمایش ۲۰ خط اول"></textarea>
+        <button id="import-button" class="button primary" disabled>اعتبارسنجی و ورود</button>
+        <div id="import-result" class="result hidden"></div>
+      </div>
+    </section>
+
+    <section id="page-users" class="page">
+      <div class="grid two">
+        <div class="card">
+          <h2>ایجاد کاربر</h2>
+          <form id="create-user-form">
+            <label>شناسه<input id="new-user-id" required maxlength="128" placeholder="U101"></label>
+            <label>نام نمایشی<input id="new-username" maxlength="128" placeholder="اختیاری"></label>
+            <button class="button primary" type="submit">ایجاد کاربر</button>
+          </form>
+        </div>
+        <div class="card">
+          <h2>ویرایش یا حذف</h2>
+          <label>کاربر<select id="manage-user"></select></label>
+          <label>نام نمایشی جدید<input id="edit-username"></label>
+          <div class="actions">
+            <button id="edit-user-button" class="button">ذخیره ویرایش</button>
+            <button id="delete-user-button" class="button danger">حذف کاربر</button>
+          </div>
+        </div>
+      </div>
+      <div class="card">
+        <div class="card-head"><h2>فهرست کاربران</h2><input id="user-search" placeholder="جست‌وجو…"></div>
+        <div class="table-wrap"><table><thead><tr><th>شناسه</th><th>نام نمایشی</th></tr></thead><tbody id="users-body"></tbody></table></div>
+      </div>
+    </section>
+
+    <section id="page-relationships" class="page">
+      <div class="card">
+        <h2>ایجاد ارتباط دوطرفه</h2>
+        <form id="create-relationship-form" class="inline-form">
+          <label>کاربر اول<select id="relation-a"></select></label>
+          <span class="arrow">↔</span>
+          <label>کاربر دوم<select id="relation-b"></select></label>
+          <button class="button primary" type="submit">ایجاد ارتباط</button>
+        </form>
+      </div>
+      <div class="card">
+        <h2>ارتباط‌ها</h2>
+        <div class="table-wrap"><table><thead><tr><th>کاربر اول</th><th>کاربر دوم</th><th></th></tr></thead><tbody id="relationships-body"></tbody></table></div>
+      </div>
+    </section>
+
+    <section id="page-graph" class="page">
+      <div class="card graph-card">
+        <div class="card-head"><div><h2>نمای گراف زنده</h2><p id="graph-summary" class="muted"></p></div><button id="reload-graph" class="button">تازه‌سازی گراف</button></div>
+        <div id="graph-empty" class="empty hidden">هنوز داده‌ای برای نمایش وجود ندارد.</div>
+        <svg id="graph-svg" viewBox="0 0 1000 650" aria-label="گراف شبکه اجتماعی"></svg>
+      </div>
+    </section>
+
+    <section id="page-algorithms" class="page">
+      <div class="grid algorithm-grid">
+        <div class="card">
+          <h2>اجرای الگوریتم</h2>
+          <label>الگوریتم<select id="algorithm-select"></select></label>
+          <form id="algorithm-form"><div id="algorithm-fields"></div><button class="button primary" type="submit">اجرای تحلیل</button></form>
+        </div>
+        <div class="card result-card">
+          <div class="card-head"><h2>نتیجه</h2><span id="algorithm-time" class="badge"></span></div>
+          <div id="algorithm-placeholder" class="empty">یک الگوریتم انتخاب و اجرا کنید.</div>
+          <pre id="algorithm-result" class="hidden"></pre>
+        </div>
+      </div>
+    </section>
+  </main>
+
+  <div id="loading" class="loading hidden"><div class="spinner"></div><span>لطفاً صبر کنید…</span></div>
+  <script src="/static/app.js"></script>
+</body>
+</html>
+
