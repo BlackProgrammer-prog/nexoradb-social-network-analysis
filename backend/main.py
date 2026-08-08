@@ -22,7 +22,7 @@ from schemas import (
 )
 from import_service import process_import, generate_insert_queries
 from repositories import UserRepository, RelationshipRepository, GraphRepository
-from algorithm_service import AlgorithmService, ALL_ALGORITHMS
+from algorithm_service import AlgorithmService, ALL_ALGORITHMS, LOCK_ALGORITHMS, JOB_ALGORITHMS
 
 # ============================================================================
 # Logging Setup
@@ -156,50 +156,49 @@ async def import_file(
     U01 U03 1
     U02 U03 1
 
+    Rules:
+    - Flag must be exactly "1" (mutual relationship)
+    - Self-loops are rejected
+    - Reverse duplicates are detected and skipped
+    - Each unique pair creates two directed edges
+    """
+    # Validate file size
+    content = await file.read()
+    if len(content) > settings.MAX_FILE_SIZE_MB * 1024 * 1024:
+        raise HTTPException(
+            status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+            detail=f"File size exceeds the maximum allowed limit of {settings.MAX_FILE_SIZE_MB}MB"
+        )
 
-Rules:
-- Flag must be exactly "1" (mutual relationship)
-- Self-loops are rejected
-- Reverse duplicates are detected and skipped
-- Each unique pair creates two directed edges
-"""
-# Validate file size
-content = await file.read()
-if len(content) > settings.MAX_FILE_SIZE_MB * 1024 * 1024:
-    raise HTTPException(
-        status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
-        detail=f"File size exceeds the maximum allowed limit of {settings.MAX_FILE_SIZE_MB}MB"
-    )
-
-# Validate encoding
-try:
-    text = content.decode("utf-8")
-except UnicodeDecodeError:
-    raise HTTPException(
-        status_code=status.HTTP_400_BAD_REQUEST,
-        detail="File must be encoded in UTF-8"
-    )
-
-# Process and validate
-result = process_import(text)
-
-if not result.success:
-    return result
-
-# Execute queries
-queries = generate_insert_queries(text)
-for query in queries:
+    # Validate encoding
     try:
-        client.execute(query)
-    except NexoraDBQueryError as e:
-        result.errors.append(str(e))
+        text = content.decode("utf-8")
+    except UnicodeDecodeError:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="File must be encoded in UTF-8"
+        )
+
+    # Process and validate
+    result = process_import(text)
+
+    if not result.success:
         return result
 
-logger.info(
-    f"Import completed: {result.unique_users} users, "
-    f"{result.unique_pairs} pairs, {result.directed_edges_created} directed edges"
-)
-return result
+    # Execute queries
+    queries = generate_insert_queries(text)
+    for query in queries:
+        try:
+            client.execute(query)
+        except NexoraDBQueryError as e:
+            result.errors.append(str(e))
+            return result
+
+    logger.info(
+        f"Import completed: {result.unique_users} users, "
+        f"{result.unique_pairs} pairs, {result.directed_edges_created} directed edges"
+    )
+    return result
 
 # ============================================================================
 # User CRUD Endpoints
@@ -321,3 +320,79 @@ async def delete_relationship(
 
     repo.delete(user_a, user_b)
     return {"deleted": True, "user_a": user_a, "user_b": user_b}
+
+# ============================================================================
+# Graph Endpoints
+# ============================================================================
+
+@app.get("/api/v1/graph")
+async def get_graph(
+    limit: int = 500,
+    client=Depends(get_client)
+):
+    """Get a graph snapshot for visualization."""
+    repo = GraphRepository(client)
+    return repo.get_snapshot(limit)
+
+
+@app.get("/api/v1/graph/stats")
+async def get_graph_stats(
+    client=Depends(get_client)
+):
+    """Get graph statistics."""
+    repo = GraphRepository(client)
+    return repo.get_stats()
+
+# ============================================================================
+# Algorithm Endpoints
+# ============================================================================
+
+@app.get("/api/v1/algorithms")
+async def list_algorithms():
+    """List all available algorithms."""
+    return {
+        "algorithms": list(ALL_ALGORITHMS.keys()),
+        "lock": list(LOCK_ALGORITHMS.keys()),
+        "job": list(JOB_ALGORITHMS.keys())
+    }
+
+
+@app.get("/api/v1/algorithms/{name}/params")
+async def get_algorithm_params(name: str):
+    """Get parameter definitions for a specific algorithm."""
+    service = AlgorithmService(get_client())
+    try:
+        return {"params": service.get_algorithm_params(name)}
+    except ValueError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+
+
+@app.post("/api/v1/algorithms/{name}")
+async def run_algorithm(
+    name: str,
+    request: AlgorithmRequest,
+    client=Depends(get_client)
+) -> AlgorithmResponse:
+    """Execute a specific algorithm with given parameters."""
+    service = AlgorithmService(client)
+
+    try:
+        return service.execute_algorithm(name, request.params)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except NexoraDBQueryError as e:
+        raise HTTPException(status_code=502, detail=str(e))
+
+# ============================================================================
+# Root Endpoint
+# ============================================================================
+
+@app.get("/")
+async def root():
+    """Root endpoint with service information."""
+    return {
+        "app": settings.APP_NAME,
+        "version": "1.0.0",
+        "status": "running",
+        "docs": "/docs" if settings.DEBUG else None
+    }
