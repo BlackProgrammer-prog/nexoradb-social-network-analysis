@@ -9,9 +9,9 @@ const algorithms={
   FriendSuggestion:{label:'پیشنهاد دوست',fields:[['user','کاربر','user'],['limit','حداکثر نتیجه','number',10]]},
   MostConnected:{label:'پرارتباط‌ترین کاربران',fields:[['metric','معیار','choice',['total','in','out']],['limit','تعداد','number',10]]},
   NetworkStats:{label:'آمار کامل شبکه',fields:[]},
-  ConnectedComponents:{label:'مولفه‌های همبند',fields:[]},
+  ConnectedComponents:{label:' گروه های شبکه',fields:[]},
   AllDistances:{label:'فاصله‌ها از یک کاربر',fields:[['source','کاربر مبدأ','user'],['max_hops','حداکثر فاصله','number',100]]},
-  BetweennessCentrality:{label:'مرکزیت بینابینی',fields:[['top','تعداد کاربران برتر','number',10]]},
+  BetweennessCentrality:{label:'پل های ارتباطی ',fields:[['top','تعداد کاربران برتر','number',10]]},
   CommunityDetection:{label:'تشخیص اجتماع',fields:[['max_iterations','حداکثر تکرار','number',30],['min_community_size','حداقل اندازه','number',2]]},
   InfluenceMaximization:{label:'بیشینه‌سازی نفوذ',fields:[['k','تعداد seed','number',3],['simulations','تعداد شبیه‌سازی','number',25],['probability','احتمال انتشار','decimal',.2]]}
 };
