@@ -271,3 +271,53 @@ async def delete_user(
 
     repo.delete(user_id)
     return {"deleted": True, "user_id": user_id}
+
+# ============================================================================
+# Relationship CRUD Endpoints
+# ============================================================================
+
+@app.get("/api/v1/relationships")
+async def list_relationships(
+    limit: int = 1000,
+    client=Depends(get_client)
+):
+    """List all unique relationship pairs."""
+    repo = RelationshipRepository(client)
+    return {"items": repo.get_all_pairs(limit), "total": repo.count_pairs()}
+
+
+@app.post("/api/v1/relationships")
+async def create_relationship(
+    rel: RelationshipCreate,
+    client=Depends(get_client)
+):
+    """Create a two-way relationship between two users."""
+    repo = RelationshipRepository(client)
+
+    # Check if relationship already exists
+    if repo.exists(rel.user_a, rel.user_b):
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail={"message": f"Relationship between {rel.user_a} and {rel.user_b} already exists"}
+        )
+
+    return repo.create(rel.user_a, rel.user_b)
+
+
+@app.delete("/api/v1/relationships/{user_a}/{user_b}")
+async def delete_relationship(
+    user_a: str,
+    user_b: str,
+    client=Depends(get_client)
+):
+    """Delete a two-way relationship between two users."""
+    repo = RelationshipRepository(client)
+
+    if not repo.exists(user_a, user_b):
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail={"message": f"Relationship between {user_a} and {user_b} not found"}
+        )
+
+    repo.delete(user_a, user_b)
+    return {"deleted": True, "user_a": user_a, "user_b": user_b}
