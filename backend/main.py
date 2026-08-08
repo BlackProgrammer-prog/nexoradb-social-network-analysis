@@ -1,398 +1,159 @@
-"""FastAPI application for the NexoraDB Social Graph Service.
-
-This is the main entry point for the backend service. All endpoints
-are defined here with proper authentication and error handling.
-"""
-
 from __future__ import annotations
 
-import uuid
-import logging
-from contextlib import asynccontextmanager
+from functools import lru_cache
 
-from fastapi import FastAPI, UploadFile, File, HTTPException, status, Depends
+from fastapi import FastAPI, File, HTTPException, Query, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 
-from settings import settings
-from nexora_client import create_nexora_client, NexoraDBConnectionError, NexoraDBQueryError
-from schemas import (
-    HealthResponse, ImportResponse, UserCreate, UserUpdate,
-    RelationshipCreate, GraphSnapshot, AlgorithmRequest, AlgorithmResponse,
-    ErrorResponse
-)
-from import_service import process_import, generate_insert_queries
-from repositories import UserRepository, RelationshipRepository, GraphRepository
-from algorithm_service import AlgorithmService, ALL_ALGORITHMS, LOCK_ALGORITHMS, JOB_ALGORITHMS
+from .file_parser import FileFormatError, parse_relationship_file
+from .nexora_service import DRIVER_ERRORS, NexoraSocialService, ServiceError
+from .schemas import AlgorithmRequest, RelationshipCreate, UserCreate, UserUpdate
+from .settings import settings
 
-# ============================================================================
-# Logging Setup
-# ============================================================================
-
-logging.basicConfig(
-    level=logging.INFO if not settings.DEBUG else logging.DEBUG,
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
-)
-logger = logging.getLogger(__name__)
-
-# ============================================================================
-# Lifespan Management
-# ============================================================================
-
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    """Manage the application lifecycle."""
-    logger.info(f"Starting {settings.APP_NAME} in {settings.ENVIRONMENT} mode")
-
-    # Validate critical settings
-    settings.validate_for_startup()
-
-    # Initialize client and check connectivity
-    client = create_nexora_client(settings)
-    if not client.ping():
-        logger.warning("NexoraDB is not reachable! Please check the connection.")
-    else:
-        logger.info("Connected to NexoraDB successfully ✅")
-
-    # Store client in app state
-    app.state.client = client
-
-    # Ensure collections and graph exist (idempotent)
-    _ensure_initial_setup(client)
-
-    yield
-
-    logger.info("Shutting down...")
-
-
-def _ensure_initial_setup(client):
-    """Ensure collections and graph exist (idempotent setup)."""
-    try:
-        # Check existing collections
-        result = client.execute("SHOW COLLECTIONS;")
-        collections = [row.get("name") for row in (result.rows if hasattr(result, "rows") else [])]
-
-        if "professor_users" not in collections:
-            client.execute("CREATE COLLECTION professor_users;")
-            logger.info("✅ Created collection: professor_users")
-
-        if "professor_follows" not in collections:
-            client.execute("CREATE COLLECTION professor_follows;")
-            logger.info("✅ Created collection: professor_follows")
-
-        # Create live graph and mappings (idempotent)
-        client.execute("CREATE LIVE GRAPH professor_social HETEROGENEOUS DIRECTED;")
-        client.execute("MAP NODE User FROM professor_users KEY _id PROPERTIES username;")
-        client.execute("MAP EDGE FOLLOWS FROM professor_follows SOURCE from_id AS User TARGET to_id AS User DIRECTED;")
-        logger.info("✅ LiveGraph professor_social is ready")
-
-    except Exception as e:
-        logger.warning(f"Initial setup warning: {e}")
-        # This is safe to ignore if setup already exists
-
-# ============================================================================
-# FastAPI Application
-# ============================================================================
 
 app = FastAPI(
-    title=settings.APP_NAME,
+    title="Social Network Analysis API",
+    description="External demo API connected to NexoraDB through its Python driver.",
     version="1.0.0",
-    lifespan=lifespan,
-    docs_url="/docs" if settings.DEBUG else None,
 )
-
-# CORS Middleware
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=settings.ALLOWED_ORIGINS,
-    allow_credentials=True,
+    allow_origins=["http://localhost:8501", "http://127.0.0.1:8501"],
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# ============================================================================
-# Dependency Injection
-# ============================================================================
 
-def get_client():
-    """Dependency for getting the NexoraDB client."""
-    return app.state.client
+@lru_cache(maxsize=1)
+def service() -> NexoraSocialService:
+    return NexoraSocialService(settings)
 
-# ============================================================================
-# Health Check
-# ============================================================================
 
-@app.get("/health", response_model=HealthResponse)
-async def health():
-    """Check the health of the service and database connectivity."""
-    client = get_client()
+def fail(exc: Exception) -> None:
+    if isinstance(exc, ServiceError):
+        raise HTTPException(status_code=exc.status_code, detail=str(exc)) from exc
+    if isinstance(exc, DRIVER_ERRORS):
+        raise HTTPException(status_code=503, detail=f"خطا در اتصال به NexoraDB: {exc}") from exc
+    raise exc
+
+
+@app.get("/api/v1/health")
+def health() -> dict:
     try:
-        connected = client.ping()
-        return HealthResponse(
-            status="healthy" if connected else "unhealthy",
-            database_connected=connected,
-            version="1.0.0"
-        )
-    except Exception as e:
-        logger.error(f"Health check failed: {e}")
-        return HealthResponse(
-            status="unhealthy",
-            database_connected=False,
-            version="1.0.0"
-        )
+        connected = service().ping()
+        return {"status": "ok" if connected else "degraded", "database_connected": connected}
+    except Exception as exc:
+        return {"status": "degraded", "database_connected": False, "message": str(exc)}
 
-# ============================================================================
-# Import Endpoint
-# ============================================================================
+
+@app.post("/api/v1/setup")
+def setup() -> dict:
+    try:
+        service().ensure_schema()
+        return {"message": "collectionها و LiveGraph آماده هستند.", "build_required": False}
+    except Exception as exc:
+        fail(exc)
+
+
+@app.get("/api/v1/dashboard")
+def dashboard() -> dict:
+    try:
+        return service().dashboard()
+    except Exception as exc:
+        fail(exc)
+
 
 @app.post("/api/v1/imports/relationships")
-async def import_file(
-    file: UploadFile = File(...),
-    client=Depends(get_client)
-) -> ImportResponse:
-    """Import a three-column relationship file.
-
-    The file format is:
-    U01 U02 1
-    U01 U03 1
-    U02 U03 1
-
-    Rules:
-    - Flag must be exactly "1" (mutual relationship)
-    - Self-loops are rejected
-    - Reverse duplicates are detected and skipped
-    - Each unique pair creates two directed edges
-    """
-    # Validate file size
+async def import_relationships(file: UploadFile = File(...)) -> dict:
+    if file.size is not None and file.size > 10 * 1024 * 1024:
+        raise HTTPException(status_code=413, detail="حداکثر اندازه فایل ۱۰ مگابایت است.")
     content = await file.read()
-    if len(content) > settings.MAX_FILE_SIZE_MB * 1024 * 1024:
-        raise HTTPException(
-            status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
-            detail=f"File size exceeds the maximum allowed limit of {settings.MAX_FILE_SIZE_MB}MB"
-        )
-
-    # Validate encoding
     try:
-        text = content.decode("utf-8")
-    except UnicodeDecodeError:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="File must be encoded in UTF-8"
-        )
+        parsed = parse_relationship_file(content)
+        return service().import_parsed(parsed)
+    except FileFormatError as exc:
+        raise HTTPException(status_code=400, detail={"message": "فایل نامعتبر است.", "errors": exc.errors}) from exc
+    except Exception as exc:
+        fail(exc)
 
-    # Process and validate
-    result = process_import(text)
-
-    if not result.success:
-        return result
-
-    # Execute queries
-    queries = generate_insert_queries(text)
-    for query in queries:
-        try:
-            client.execute(query)
-        except NexoraDBQueryError as e:
-            result.errors.append(str(e))
-            return result
-
-    logger.info(
-        f"Import completed: {result.unique_users} users, "
-        f"{result.unique_pairs} pairs, {result.directed_edges_created} directed edges"
-    )
-    return result
-
-# ============================================================================
-# User CRUD Endpoints
-# ============================================================================
 
 @app.get("/api/v1/users")
-async def list_users(
-    limit: int = 1000,
-    client=Depends(get_client)
-):
-    """List all users with optional limit."""
-    repo = UserRepository(client)
-    return {"items": repo.get_all(limit), "total": repo.count()}
+def list_users(search: str = "", limit: int = Query(default=1000, ge=1, le=10000)) -> dict:
+    try:
+        items = service().list_users(limit=limit)
+        if search.strip():
+            needle = search.strip().lower()
+            items = [
+                item for item in items
+                if needle in str(item.get("_id", "")).lower()
+                or needle in str(item.get("username", "")).lower()
+            ]
+        return {"items": items, "total": len(items)}
+    except Exception as exc:
+        fail(exc)
 
 
-@app.post("/api/v1/users")
-async def create_user(
-    user: UserCreate,
-    client=Depends(get_client)
-):
-    """Create a new user."""
-    repo = UserRepository(client)
-
-    # Check if user already exists
-    existing = repo.get_by_id(user._id)
-    if existing:
-        raise HTTPException(
-            status_code=status.HTTP_409_CONFLICT,
-            detail={"message": f"User '{user._id}' already exists"}
-        )
-
-    username = user.username or user._id
-    return repo.create(user._id, username)
+@app.post("/api/v1/users", status_code=201)
+def create_user(payload: UserCreate) -> dict:
+    try:
+        return service().create_user(payload.id, payload.username)
+    except Exception as exc:
+        fail(exc)
 
 
 @app.put("/api/v1/users/{user_id}")
-async def update_user(
-    user_id: str,
-    update: UserUpdate,
-    client=Depends(get_client)
-):
-    """Update a user's username."""
-    repo = UserRepository(client)
-
-    existing = repo.get_by_id(user_id)
-    if not existing:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail={"message": f"User '{user_id}' not found"}
-        )
-
-    return repo.update(user_id, update.username)
+def update_user(user_id: str, payload: UserUpdate) -> dict:
+    try:
+        return service().update_user(user_id, payload.username)
+    except Exception as exc:
+        fail(exc)
 
 
 @app.delete("/api/v1/users/{user_id}")
-async def delete_user(
-    user_id: str,
-    client=Depends(get_client)
-):
-    """Delete a user and all associated relationships."""
-    repo = UserRepository(client)
+def delete_user(user_id: str) -> dict:
+    try:
+        return service().delete_user(user_id)
+    except Exception as exc:
+        fail(exc)
 
-    existing = repo.get_by_id(user_id)
-    if not existing:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail={"message": f"User '{user_id}' not found"}
-        )
-
-    repo.delete(user_id)
-    return {"deleted": True, "user_id": user_id}
-
-# ============================================================================
-# Relationship CRUD Endpoints
-# ============================================================================
 
 @app.get("/api/v1/relationships")
-async def list_relationships(
-    limit: int = 1000,
-    client=Depends(get_client)
-):
-    """List all unique relationship pairs."""
-    repo = RelationshipRepository(client)
-    return {"items": repo.get_all_pairs(limit), "total": repo.count_pairs()}
+def list_relationships() -> dict:
+    try:
+        items = service().list_relationships()
+        return {"items": items, "total": len(items)}
+    except Exception as exc:
+        fail(exc)
 
 
-@app.post("/api/v1/relationships")
-async def create_relationship(
-    rel: RelationshipCreate,
-    client=Depends(get_client)
-):
-    """Create a two-way relationship between two users."""
-    repo = RelationshipRepository(client)
-
-    # Check if relationship already exists
-    if repo.exists(rel.user_a, rel.user_b):
-        raise HTTPException(
-            status_code=status.HTTP_409_CONFLICT,
-            detail={"message": f"Relationship between {rel.user_a} and {rel.user_b} already exists"}
-        )
-
-    return repo.create(rel.user_a, rel.user_b)
+@app.post("/api/v1/relationships", status_code=201)
+def create_relationship(payload: RelationshipCreate) -> dict:
+    try:
+        return service().create_relationship(payload.user_a, payload.user_b)
+    except Exception as exc:
+        fail(exc)
 
 
 @app.delete("/api/v1/relationships/{user_a}/{user_b}")
-async def delete_relationship(
-    user_a: str,
-    user_b: str,
-    client=Depends(get_client)
-):
-    """Delete a two-way relationship between two users."""
-    repo = RelationshipRepository(client)
+def delete_relationship(user_a: str, user_b: str) -> dict:
+    try:
+        return service().delete_relationship(user_a, user_b)
+    except Exception as exc:
+        fail(exc)
 
-    if not repo.exists(user_a, user_b):
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail={"message": f"Relationship between {user_a} and {user_b} not found"}
-        )
-
-    repo.delete(user_a, user_b)
-    return {"deleted": True, "user_a": user_a, "user_b": user_b}
-
-# ============================================================================
-# Graph Endpoints
-# ============================================================================
 
 @app.get("/api/v1/graph")
-async def get_graph(
-    limit: int = 500,
-    client=Depends(get_client)
-):
-    """Get a graph snapshot for visualization."""
-    repo = GraphRepository(client)
-    return repo.get_snapshot(limit)
-
-
-@app.get("/api/v1/graph/stats")
-async def get_graph_stats(
-    client=Depends(get_client)
-):
-    """Get graph statistics."""
-    repo = GraphRepository(client)
-    return repo.get_stats()
-
-# ============================================================================
-# Algorithm Endpoints
-# ============================================================================
-
-@app.get("/api/v1/algorithms")
-async def list_algorithms():
-    """List all available algorithms."""
-    return {
-        "algorithms": list(ALL_ALGORITHMS.keys()),
-        "lock": list(LOCK_ALGORITHMS.keys()),
-        "job": list(JOB_ALGORITHMS.keys())
-    }
-
-
-@app.get("/api/v1/algorithms/{name}/params")
-async def get_algorithm_params(name: str):
-    """Get parameter definitions for a specific algorithm."""
-    service = AlgorithmService(get_client())
+def graph() -> dict:
     try:
-        return {"params": service.get_algorithm_params(name)}
-    except ValueError as e:
-        raise HTTPException(status_code=404, detail=str(e))
+        return service().graph_view()
+    except Exception as exc:
+        fail(exc)
 
 
 @app.post("/api/v1/algorithms/{name}")
-async def run_algorithm(
-    name: str,
-    request: AlgorithmRequest,
-    client=Depends(get_client)
-) -> AlgorithmResponse:
-    """Execute a specific algorithm with given parameters."""
-    service = AlgorithmService(client)
-
+def run_algorithm(name: str, payload: AlgorithmRequest) -> dict:
     try:
-        return service.execute_algorithm(name, request.params)
-    except ValueError as e:
-        raise HTTPException(status_code=400, detail=str(e))
-    except NexoraDBQueryError as e:
-        raise HTTPException(status_code=502, detail=str(e))
+        return service().run_algorithm(name, payload.parameters)
+    except Exception as exc:
+        fail(exc)
 
-# ============================================================================
-# Root Endpoint
-# ============================================================================
-
-@app.get("/")
-async def root():
-    """Root endpoint with service information."""
-    return {
-        "app": settings.APP_NAME,
-        "version": "1.0.0",
-        "status": "running",
-        "docs": "/docs" if settings.DEBUG else None
-    }
